@@ -15,7 +15,7 @@ python3 app.py
 
 ## 主要接口
 
-请求头 `X-User`、`X-Role` 表示用户与角色。角色有 `intake`、`adjuster`、`surveyor`、`supervisor`、`auditor`。
+请求头 `X-User`、`X-Role` 表示用户与角色。角色有 `intake`、`adjuster`、`surveyor`、`supervisor`、`auditor`、`finance`。
 
 - `GET /health`、`GET /api/state`、`GET /api/queue`
 - `POST /api/claims`：创建报案并识别重复报案
@@ -25,6 +25,20 @@ python3 app.py
 - `POST /api/claims/survey`、`POST /api/claims/submit-review`
 - `POST /api/claims/emergency-advance`：仅限监督人员、紧急且未超20%的案件
 - `POST /api/claims/finalize`：锁定最终核定结果
+- `POST /api/reinsurance/treaties`：按灾害事件建立分层分保合约（`finance`/`supervisor`）
+- `GET /api/reinsurance/treaties`：列出全部事件合约与汇总占用
+- `GET /api/reinsurance/ledger?event_id=...|treaty_id=...`：逐案逐层分保台账
+- `POST /api/reinsurance/confirm`：财务保存确认分保结果（乐观锁 `expected_version`）
+
+## 再保分保规则
+
+按灾害事件配置一套分保程序：**自留额先扣**，其后按层序分保；每层含再保人、分保比例、赔付上限。
+
+- 层赔付上限是**摊回口径**且为事件内全部已核案件共享：每层最多吸收毛赔款 `上限 / 分保比例`，摊回 = 毛额 × 比例。
+- 案件瀑布：先占自留额；剩余按层序逐层吸收，本层占满后的差额滚入下一层；全部层占满仍有剩余记为**未覆盖**。
+- 同一事件内案件按核定先后累计占用同一套上限；后续核定自动重算整表，并把已确认合约退回待确认。
+- 确认时若存在未覆盖金额，返回 409，`details.blocked_claims` 逐案列出超赔案件、溢层路径（合约层、超出金额）。
+- 分摊结果（`cession_entries`）与溢层记录（`cession_overflows`）持久化到 SQLite，重开页面可逐案逐层核对。
 
 ## 测试
 

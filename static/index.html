@@ -1,6 +1,165 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>巨灾理赔调度</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#263746}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#f1f5f7}.card{background:#fff8eb;border-left:5px solid #d58b21;padding:12px 16px}code{background:#eef2f4;padding:2px 5px}</style>
-<h1>巨灾保险理赔调度</h1><div class="card">状态页按调用角色过滤。写入接口需要 <code>X-User</code>、<code>X-Role</code>，详见 README。</div>
-<h2>优先队列</h2><table id="claims"><thead><tr><th>报案号</th><th>区域</th><th>状态</th><th>优先级</th><th>欺诈分</th><th>负责人</th></tr></thead><tbody></tbody></table>
-<h2>最近时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#claims tbody').innerHTML=d.claims.map(r=>`<tr><td>${r.claim_no}</td><td>${r.region}</td><td>${r.status}</td><td>${r.priority_score.toFixed(1)}</td><td>${r.fraud_score}</td><td>${r.assignee||''}</td></tr>`).join('');document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>巨灾理赔调度 · 再保分保台账</title>
+<style>
+  body{font:14px/1.6 system-ui,sans-serif;max-width:1240px;margin:24px auto;padding:0 20px;color:#263746}
+  h1{font-size:22px}h2{font-size:17px;margin:26px 0 8px}
+  table{border-collapse:collapse;width:100%;margin:10px 0;font-size:13px}
+  th,td{border:1px solid #d3dce3;padding:6px 8px;text-align:right;white-space:nowrap}
+  th:first-child,td:first-child,th.txt,td.txt{text-align:left;white-space:normal}
+  th{background:#f1f5f7}
+  tr.uncov td{background:#fdecea}tr.ret td{background:#eef4ff}tr.cede td{background:#f3faf1}
+  .card{background:#fff8eb;border-left:5px solid #d58b21;padding:10px 16px;margin:10px 0}
+  .danger{background:#fdecea;border-left:5px solid #c0392b;padding:10px 16px;margin:10px 0;display:none}
+  .ok{background:#eef8ee;border-left:5px solid #2e7d32;padding:10px 16px;margin:10px 0;display:none}
+  code{background:#eef2f4;padding:2px 5px}
+  input,select,button{font:inherit;padding:4px 8px;margin:2px}
+  button{cursor:pointer;border:1px solid #8aa0b0;background:#f5f8fa;border-radius:4px}
+  button.primary{background:#1f6feb;color:#fff;border-color:#1f6feb}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px}
+  .tag.pending{background:#fff3cd}.tag.confirmed{background:#d4edda}
+  .muted{color:#6b7c8a;font-size:12px}
+  #blockDetail{display:none;margin-top:8px}
+  .right{text-align:right}
+</style>
+<h1>巨灾保险理赔调度 · 再保分保台账</h1>
+<div class="card">
+  操作人
+  <input id="user" value="fin1" size="10">
+  角色
+  <select id="role">
+    <option value="finance">finance（财务）</option>
+    <option value="supervisor">supervisor（监督）</option>
+    <option value="auditor">auditor（审计/只读）</option>
+    <option value="intake">intake</option>
+    <option value="adjuster">adjuster</option>
+  </select>
+  <button onclick="loadAll()">刷新</button>
+  <span class="muted">自留额先扣 → 各层按比例及事件累计上限摊赔 → 超出滚下一层 → 层全占满记未覆盖</span>
+</div>
+<div id="msgOk" class="ok"></div>
+<div id="msgErr" class="danger"></div>
+
+<h2>灾害事件分保合约</h2>
+<table id="treaties"><thead><tr><th class="txt">事件</th><th>自留额</th><th>层数</th><th>已核毛赔</th><th>自留占用</th><th>摊回合计</th><th>未覆盖</th><th>状态</th><th>操作</th></tr></thead><tbody></tbody></table>
+
+<div id="ledgerBox" style="display:none">
+<h2 id="ledgerTitle">分保台账</h2>
+<div id="ledgerMeta" class="muted"></div>
+<h3>层占用（同一灾害事件全部已核案件共享）</h3>
+<table id="layers"><thead><tr><th>层序</th><th class="txt">再保人</th><th>分保比例</th><th>赔付上限</th><th>已占用（摊回）</th><th>剩余</th><th>状态</th></tr></thead><tbody></tbody></table>
+<h3>逐案逐层明细</h3>
+<div id="claims"></div>
+<p><button id="btnConfirm" class="primary" onclick="confirmLedger()">保存并确认分保结果</button>
+<span class="muted">存在未覆盖金额时确认将被整体挡下，并列出案件、合约层和超出金额。</span></p>
+<div id="blockDetail" class="danger"></div>
+</div>
+
+<h2>新建分保合约</h2>
+<table id="newLayers">
+  <thead><tr><th>层序</th><th class="txt">再保人</th><th>分保比例(0-1)</th><th>赔付上限(元)</th><th></th></tr></thead>
+  <tbody></tbody>
+</table>
+<button onclick="addLayerRow()">加一层</button>
+<p>事件编号 <input id="newEvent" value="TY2026" size="10"> 自留额 <input id="newRetention" type="number" value="100000" step="0.01">
+<button class="primary" onclick="createTreaty()">创建合约并重算台账</button></p>
+
+<script>
+let treaties = [], current = null;
+const $ = s => document.querySelector(s);
+function headers(extra){return Object.assign({'X-User':$('#user').value,'X-Role':$('#role').value},extra||{})}
+function fmt(n){return (Number(n)||0).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2})}
+function showOk(t){const e=$('#msgOk');e.style.display='block';e.textContent=t;$('#msgErr').style.display='none';setTimeout(()=>e.style.display='none',6000)}
+function showErr(t,d){const e=$('#msgErr');e.style.display='block';e.textContent=t;renderBlock(d)}
+async function api(path,opt){const r=await fetch(path,Object.assign({headers:headers({'Content-Type':'application/json'})},opt||{}));const d=await r.json();if(!r.ok)throw Object.assign(new Error(d.error),{details:d.details});return d}
+
+function addLayerRow(order,reinsurer,ratio,limit){
+  const tr=document.createElement('tr');
+  tr.innerHTML=`<td><input class="lo" type="number" value="${order||''}" style="width:50px"></td>
+    <td><input class="lr" value="${reinsurer||''}" style="width:140px"></td>
+    <td><input class="lx" type="number" step="0.01" min="0" max="1" value="${ratio??''}" style="width:80px"></td>
+    <td><input class="ll" type="number" step="0.01" value="${limit??''}" style="width:130px"></td>
+    <td><button onclick="this.closest('tr').remove()">删</button></td>`;
+  $('#newLayers tbody').appendChild(tr);
+}
+async function createTreaty(){
+  const layers=[...document.querySelectorAll('#newLayers tbody tr')].map(tr=>({
+    layer_order:parseInt(tr.querySelector('.lo').value),
+    reinsurer:tr.querySelector('.lr').value,
+    cede_ratio:parseFloat(tr.querySelector('.lx').value),
+    payout_limit:parseFloat(tr.querySelector('.ll').value),
+  }));
+  try{
+    await api('/api/reinsurance/treaties',{method:'POST',body:JSON.stringify({
+      event_id:$('#newEvent').value, retention:parseFloat($('#newRetention').value), layers})});
+    showOk('合约已创建，台账已重算');loadAll();
+  }catch(e){showErr(e.message,e.details)}
+}
+async function loadAll(){
+  $('#blockDetail').style.display='none';
+  try{treaties=(await api('/api/reinsurance/treaties')).treaties}
+  catch(e){showErr(e.message,e.details);return}
+  const tb=$('#treaties tbody');tb.innerHTML='';
+  treaties.forEach(t=>{
+    const tr=document.createElement('tr');
+    const uncov=t.totals.uncovered>0.005;
+    tr.innerHTML=`<td class="txt">${t.treaty.event_id}</td><td>${fmt(t.treaty.retention)}</td>
+      <td>${t.layer_count}</td><td>${fmt(t.totals.gross)}</td><td>${fmt(t.totals.retention)}</td>
+      <td>${fmt(t.totals.ceded)}</td><td${uncov?' style="color:#c0392b;font-weight:bold"':''}>${fmt(t.totals.uncovered)}</td>
+      <td><span class="tag ${t.treaty.status}">${t.treaty.status==='confirmed'?'已确认':'待确认'}</span></td>
+      <td><button onclick="openLedger(${t.treaty.id})">逐案核对</button></td>`;
+    tb.appendChild(tr);
+  });
+  if(current)openLedger(current.treaty.id,true);
+}
+async function openLedger(id,keep){
+  try{current=await api('/api/reinsurance/ledger?treaty_id='+id)}
+  catch(e){showErr(e.message,e.details);return}
+  $('#ledgerBox').style.display='block';
+  $('#ledgerTitle').textContent='分保台账 · 事件 '+current.treaty.event_id;
+  $('#ledgerMeta').innerHTML=`状态 <span class="tag ${current.treaty.status}">${current.treaty.status==='confirmed'?'已确认':'待确认'}</span>
+    · 自留 ${fmt(current.retention)}（已占用 ${fmt(current.retention_occupied)}，剩余 ${fmt(current.retention_remaining)}）
+    · 毛赔合计 ${fmt(current.totals.gross)} = 自留 ${fmt(current.totals.retention)} + 摊回 ${fmt(current.totals.ceded)} + 未覆盖 ${fmt(current.totals.uncovered)}
+    · 版本 v${current.treaty.version}`;
+  $('#layers tbody').innerHTML=current.layers.map(l=>`<tr${l.full?' class="uncov"':''}>
+    <td>${l.layer_order}</td><td class="txt">${l.reinsurer}</td><td>${(l.cede_ratio*100).toFixed(1)}%</td>
+    <td>${fmt(l.payout_limit)}</td><td>${fmt(l.occupied)}</td><td>${fmt(l.remaining)}</td>
+    <td>${l.full?'已满':'占用中'}</td></tr>`).join('');
+  const bucketName={retention:'公司自留',layer:'再保摊赔',uncovered:'未覆盖'};
+  $('#claims').innerHTML=current.claims.map(c=>{
+    const rows=c.breakdown.map(b=>{
+      const cls=b.bucket==='uncovered'?'uncov':b.bucket==='retention'?'ret':'cede';
+      return `<tr class="${cls}"><td>${bucketName[b.bucket]}${b.layer_order?(' · 第'+b.layer_order+'层'):''}</td>
+        <td class="txt">${b.reinsurer||''}</td><td>${b.cede_ratio?(b.cede_ratio*100).toFixed(1)+'%':'—'}</td>
+        <td>${fmt(b.gross_amount)}</td><td>${fmt(b.ceded_amount)}</td></tr>`;
+    }).join('');
+    return `<p><b>${c.claim_no}</b>（核定赔付 ${fmt(c.final_payout)}）
+      自留 ${fmt(c.retention)} ｜ 摊回 ${fmt(c.ceded)} ｜ <span${c.uncovered>0.005?' style="color:#c0392b;font-weight:bold"':''}>未覆盖 ${fmt(c.uncovered)}</span></p>
+      <table><thead><tr><th class="txt">归属</th><th class="txt">再保人</th><th>比例</th><th>毛赔款占用</th><th>摊回金额</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }).join('') || '<p class="muted">该事件暂无已核赔付案件。</p>';
+  $('#btnConfirm').disabled=$('#role').value==='auditor';
+}
+function renderBlock(d){
+  const box=$('#blockDetail');
+  if(!d){box.style.display='none';return}
+  box.style.display='block';
+  box.innerHTML=`<b>确认被挡：未覆盖合计 ${fmt(d.uncovered_total)} 元</b>` +
+    (d.blocked_claims||[]).map(c=>`<div style="margin-top:6px">案件 ${c.claim_no}（核定 ${fmt(c.final_payout)}）超出 <b>${fmt(c.uncovered_amount)}</b> 元：`+
+      '<ul>'+(c.overflow_layers||[]).map(o=>{
+        if(o.bucket==='uncovered')return `<li>全部合约层均已占满，超出 ${fmt(o.amount)} 元未覆盖</li>`;
+        return `<li>第${o.layer_order}层 ${o.reinsurer||''}（上限 ${fmt((d.layers.find(x=>x.layer_id===o.layer_id)||{}).payout_limit)}，剩余 ${fmt((d.layers.find(x=>x.layer_id===o.layer_id)||{}).remaining)}），溢出差额 ${fmt(o.amount)} 元滚入下一层</li>`;
+      }).join('')+'</ul></div>').join('');
+}
+async function confirmLedger(){
+  try{
+    const v=await api('/api/reinsurance/confirm',{method:'POST',body:JSON.stringify({
+      treaty_id:current.treaty.id, expected_version:current.treaty.version})});
+    current=v;showOk('分保结果已保存确认（状态：confirmed）');loadAll();
+  }catch(e){showErr(e.message,e.details);loadAll()}
+}
+addLayerRow(1,'中再',0.8,200000);addLayerRow(2,'慕再',0.9,200000);
+loadAll();
+</script>
+</html>

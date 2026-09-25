@@ -10,10 +10,11 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "catastrophe_claims.db"
+STAFF_ROLES = {"intake", "adjuster", "surveyor", "supervisor", "auditor", "finance"}
 TERMINAL = {"duplicate", "approved", "rejected", "closed"}
 TRANSITIONS = {
     "received": {"triaged"},
@@ -26,13 +27,22 @@ TRANSITIONS = {
 
 
 class DomainError(Exception):
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, details: Any = None):
         super().__init__(message)
         self.status = status
+        self.details = details
 
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+CENT_EPS = 0.005
+
+
+def money(value: float) -> float:
+    """金额按分取整。"""
+    return round(float(value) + 1e-9, 2)
 
 
 def require_role(role: str, allowed: set[str], action: str) -> None:
@@ -145,8 +155,54 @@ class CatastropheClaimService:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS reins_treaties (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE,
+                    retention REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    confirmed_by TEXT,
+                    confirmed_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS reins_layers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    treaty_id INTEGER NOT NULL REFERENCES reins_treaties(id),
+                    layer_order INTEGER NOT NULL,
+                    reinsurer TEXT NOT NULL,
+                    cede_ratio REAL NOT NULL,
+                    payout_limit REAL NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(treaty_id,layer_order)
+                );
+                CREATE TABLE IF NOT EXISTS cession_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    treaty_id INTEGER NOT NULL REFERENCES reins_treaties(id),
+                    claim_id INTEGER NOT NULL REFERENCES claims(id),
+                    bucket TEXT NOT NULL,
+                    layer_id INTEGER REFERENCES reins_layers(id),
+                    gross_amount REAL NOT NULL,
+                    cede_ratio REAL NOT NULL,
+                    ceded_amount REAL NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(treaty_id,claim_id,bucket,layer_id)
+                );
+                CREATE TABLE IF NOT EXISTS cession_overflows (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    treaty_id INTEGER NOT NULL REFERENCES reins_treaties(id),
+                    claim_id INTEGER NOT NULL REFERENCES claims(id),
+                    layer_id INTEGER REFERENCES reins_layers(id),
+                    bucket TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_claims_queue ON claims(status, priority_score DESC, created_at);
                 CREATE INDEX IF NOT EXISTS idx_evidence_hash ON evidence(sha256);
+                CREATE INDEX IF NOT EXISTS idx_cession_claim ON cession_entries(claim_id);
+                CREATE INDEX IF NOT EXISTS idx_cession_treaty ON cession_entries(treaty_id, claim_id);
+                CREATE INDEX IF NOT EXISTS idx_overflow_treaty ON cession_overflows(treaty_id);
                 """
             )
 
@@ -407,10 +463,354 @@ class CatastropheClaimService:
                 (status, payout if decision == "approve" else 0, utcnow(), claim_id, expected_version),
             )
             self._audit(conn, claim_id, actor, "claim.finalized", {"decision": decision, "payout": payout, "reason": reason.strip()})
+            if decision == "approve" and money(payout) > 0:
+                self._recompute_event_ledger(conn, claim["event_id"], actor)
             return dict(self._claim(conn, claim_id))
 
+    # ----- 再保分保台账 -----
+
+    def _trait_row(self, conn: sqlite3.Connection, event_id: str, lock: bool = False) -> sqlite3.Row | None:
+        sql = "SELECT * FROM reins_treaties WHERE event_id=?"
+        if lock:
+            sql += " ORDER BY id LIMIT 1"
+        return conn.execute(sql, (event_id,)).fetchone()
+
+    def _require_treaty(self, conn: sqlite3.Connection, treaty_id: int) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM reins_treaties WHERE id=?", (treaty_id,)).fetchone()
+        if not row:
+            raise DomainError("再保合约不存在", 404)
+        return row
+
+    def _trait_layers(self, conn: sqlite3.Connection, treaty_id: int) -> list[sqlite3.Row]:
+        return conn.execute(
+            "SELECT * FROM reins_layers WHERE treaty_id=? ORDER BY layer_order", (treaty_id,)
+        ).fetchall()
+
+    def create_treaty(self, actor: str, role: str, event_id: str, retention: float,
+                      layers: list[dict[str, Any]]) -> dict[str, Any]:
+        """按灾害事件建立分层分保合约：自留额先扣，其后按层顺序摊赔。"""
+        actor = actor_id(actor)
+        require_role(role, {"finance", "supervisor"}, "维护再保合约")
+        event_id = (event_id or "").strip()
+        if not event_id:
+            raise DomainError("灾害事件编号不能为空")
+        try:
+            retention = money(retention)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("自留额必须是数值") from exc
+        if retention < 0:
+            raise DomainError("自留额不能为负数")
+        if not isinstance(layers, list) or not layers:
+            raise DomainError("至少配置一个分保层")
+        normalized: list[tuple[int, str, float, float]] = []
+        orders: list[int] = []
+        for index, layer in enumerate(layers):
+            if not isinstance(layer, dict):
+                raise DomainError("分保层配置格式无效")
+            order = layer.get("layer_order", index + 1)
+            if not isinstance(order, int) or order < 1:
+                raise DomainError("分保层顺序必须是正整数")
+            reinsurer = (layer.get("reinsurer") or "").strip()
+            if not reinsurer:
+                raise DomainError("分保层再保人不能为空")
+            try:
+                ratio = float(layer["cede_ratio"])
+                limit = money(layer["payout_limit"])
+            except (TypeError, ValueError) as exc:
+                raise DomainError("分保比例或赔付上限必须是数值") from exc
+            if not 0 < ratio <= 1:
+                raise DomainError("分保比例必须在 0 到 1 之间（不含0）")
+            if limit <= 0:
+                raise DomainError("分保层赔付上限必须大于0")
+            if order in orders:
+                raise DomainError("分保层顺序不能重复：%d" % order)
+            orders.append(order)
+            normalized.append((order, reinsurer, ratio, limit))
+        normalized.sort(key=lambda item: item[0])
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if self._trait_row(conn, event_id):
+                raise DomainError("该灾害事件已存在分保合约", 409)
+            now = utcnow()
+            cur = conn.execute(
+                """INSERT INTO reins_treaties(event_id,retention,status,created_by,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?)""",
+                (event_id, retention, "pending", actor, now, now),
+            )
+            treaty_id = cur.lastrowid
+            for order, reinsurer, ratio, limit in normalized:
+                conn.execute(
+                    """INSERT INTO reins_layers(treaty_id,layer_order,reinsurer,cede_ratio,payout_limit,created_at)
+                       VALUES(?,?,?,?,?,?)""",
+                    (treaty_id, order, reinsurer, ratio, limit, now),
+                )
+            self._audit(conn, None, actor, "reinsurance.treaty_created", {
+                "treaty_id": treaty_id, "event_id": event_id, "retention": retention,
+                "layers": [{"order": o, "reinsurer": r, "cede_ratio": x, "payout_limit": y}
+                           for o, r, x, y in normalized],
+            })
+            recompute = self._recompute_event_ledger(conn, event_id, actor)
+            return self._ledger_view(conn, treaty_id, recompute=recompute)
+
+    def _recompute_event_ledger(self, conn: sqlite3.Connection, event_id: str, actor: str = "system") -> dict[str, Any] | None:
+        """对同一灾害事件的全部已核案件重算分保瀑布，结果覆写到台账。
+
+        规则：自留额先扣；每层按“分保比例 + 事件累计赔付上限”吸收毛赔款，
+        摊回=毛额×比例；本层占满后差额滚入下一层；全部层占满仍剩余则记未覆盖。
+        层上限是事件内全部已核案件共享的，案件按核定先后累计占用。
+        """
+        treaty = self._trait_row(conn, event_id, lock=True)
+        if not treaty:
+            return None
+        treaty_id = treaty["id"]
+        layers = self._trait_layers(conn, treaty_id)
+        claims = conn.execute(
+            """SELECT * FROM claims WHERE event_id=? AND status='approved' AND final_payout>0
+               ORDER BY updated_at,id""",
+            (event_id,),
+        ).fetchall()
+        conn.execute("DELETE FROM cession_entries WHERE treaty_id=?", (treaty_id,))
+        conn.execute("DELETE FROM cession_overflows WHERE treaty_id=?", (treaty_id,))
+        now = utcnow()
+        remaining_limit = [money(layer["payout_limit"]) for layer in layers]
+        retention_left = money(treaty["retention"])
+        totals = {"retention": 0.0, "ceded": 0.0, "uncovered": 0.0, "gross": 0.0}
+        overflow_rows: list[dict[str, Any]] = []
+
+        def add_entry(claim_id: int, bucket: str, layer_id: int | None, gross: float, ratio: float, ceded: float) -> None:
+            if gross <= CENT_EPS:
+                return
+            conn.execute(
+                """INSERT INTO cession_entries(treaty_id,claim_id,bucket,layer_id,gross_amount,cede_ratio,ceded_amount,created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (treaty_id, claim_id, bucket, layer_id, money(gross), ratio, money(ceded), now),
+            )
+
+        def add_overflow(claim_id: int, layer_id: int | None, bucket: str, amount: float) -> None:
+            if amount <= CENT_EPS:
+                return
+            conn.execute(
+                "INSERT INTO cession_overflows(treaty_id,claim_id,layer_id,bucket,amount,created_at) VALUES(?,?,?,?,?,?)",
+                (treaty_id, claim_id, layer_id, bucket, money(amount), now),
+            )
+            overflow_rows.append({
+                "claim_id": claim_id, "layer_id": layer_id, "bucket": bucket, "amount": money(amount),
+            })
+
+        for claim in claims:
+            payout = money(claim["final_payout"])
+            totals["gross"] = money(totals["gross"] + payout)
+            # 自留额先扣
+            to_retention = money(min(payout, retention_left))
+            add_entry(claim["id"], "retention", None, to_retention, 0.0, 0.0)
+            retention_left = money(retention_left - to_retention)
+            totals["retention"] = money(totals["retention"] + to_retention)
+            residual = money(payout - to_retention)
+            # 逐层分保，层差额滚到下一层
+            for idx, layer in enumerate(layers):
+                if residual <= CENT_EPS:
+                    break
+                if remaining_limit[idx] <= CENT_EPS:
+                    continue
+                gross_fit = money(remaining_limit[idx] / float(layer["cede_ratio"]))
+                absorbed = money(min(residual, gross_fit))
+                ceded = money(absorbed * float(layer["cede_ratio"]))
+                add_entry(claim["id"], "layer", layer["id"], absorbed, float(layer["cede_ratio"]), ceded)
+                remaining_limit[idx] = money(remaining_limit[idx] - ceded)
+                totals["ceded"] = money(totals["ceded"] + ceded)
+                spill = money(residual - absorbed)
+                if spill > CENT_EPS:
+                    add_overflow(claim["id"], layer["id"], "layer", spill)
+                residual = spill
+            if residual > CENT_EPS:
+                add_entry(claim["id"], "uncovered", None, residual, 0.0, 0.0)
+                add_overflow(claim["id"], None, "uncovered", residual)
+                totals["uncovered"] = money(totals["uncovered"] + residual)
+
+        new_status = "pending"
+        if treaty["status"] == "confirmed" and totals["gross"] > CENT_EPS:
+            # 后续核定推高层占用，已确认台账退回待确认
+            new_status = "pending"
+            conn.execute(
+                "UPDATE reins_treaties SET status='pending',version=version+1,updated_at=? WHERE id=?",
+                (now, treaty_id),
+            )
+            self._audit(conn, None, actor, "reinsurance.ledger_reopened", {
+                "event_id": event_id, "uncovered": totals["uncovered"],
+            })
+        return {
+            "event_id": event_id,
+            "gross_total": totals["gross"],
+            "retention_total": totals["retention"],
+            "ceded_total": totals["ceded"],
+            "uncovered_total": totals["uncovered"],
+            "remaining_limits": remaining_limit,
+            "overflows": overflow_rows,
+            "status": new_status,
+        }
+
+    def _ledger_view(self, conn: sqlite3.Connection, treaty_id: int,
+                     recompute: dict[str, Any] | None = None) -> dict[str, Any]:
+        treaty = self._require_treaty(conn, treaty_id)
+        layers = [dict(r) for r in self._trait_layers(conn, treaty_id)]
+        layer_map = {layer["id"]: layer for layer in layers}
+        entries = [dict(r) for r in conn.execute(
+            "SELECT * FROM cession_entries WHERE treaty_id=? ORDER BY claim_id,id", (treaty_id,)
+        ).fetchall()]
+        overflows = [dict(r) for r in conn.execute(
+            "SELECT * FROM cession_overflows WHERE treaty_id=? ORDER BY claim_id,id", (treaty_id,)
+        ).fetchall()]
+        claims = {r["id"]: dict(r) for r in conn.execute(
+            "SELECT * FROM claims WHERE event_id=? ORDER BY id", (treaty["event_id"],)
+        ).fetchall()}
+
+        occupied = {layer["id"]: 0.0 for layer in layers}
+        for entry in entries:
+            if entry["bucket"] == "layer" and entry["layer_id"] in occupied:
+                occupied[entry["layer_id"]] = money(occupied[entry["layer_id"]] + entry["ceded_amount"])
+        for layer in layers:
+            layer["occupied"] = occupied[layer["id"]]
+            layer["remaining"] = money(layer["payout_limit"] - occupied[layer["id"]])
+            layer["full"] = layer["remaining"] <= CENT_EPS
+
+        retention_total = money(sum(e["gross_amount"] for e in entries if e["bucket"] == "retention"))
+        ceded_total = money(sum(e["ceded_amount"] for e in entries if e["bucket"] == "layer"))
+        uncovered_total = money(sum(e["gross_amount"] for e in entries if e["bucket"] == "uncovered"))
+        gross_total = money(sum(e["gross_amount"] for e in entries))
+
+        for overflow in overflows:
+            if overflow["layer_id"] in layer_map:
+                overflow["layer_order"] = layer_map[overflow["layer_id"]]["layer_order"]
+                overflow["reinsurer"] = layer_map[overflow["layer_id"]]["reinsurer"]
+            claim = claims.get(overflow["claim_id"])
+            overflow["claim_no"] = claim["claim_no"] if claim else None
+
+        by_claim: dict[int, list[dict[str, Any]]] = {}
+        for entry in entries:
+            row = dict(entry)
+            if entry["layer_id"] in layer_map:
+                row["layer_order"] = layer_map[entry["layer_id"]]["layer_order"]
+                row["reinsurer"] = layer_map[entry["layer_id"]]["reinsurer"]
+            by_claim.setdefault(entry["claim_id"], []).append(row)
+
+        claim_rows = []
+        for claim_id, rows in by_claim.items():
+            claim = claims.get(claim_id, {})
+            claim_rows.append({
+                "claim_id": claim_id,
+                "claim_no": claim.get("claim_no"),
+                "final_payout": money(claim.get("final_payout") or 0),
+                "retention": money(sum(r["gross_amount"] for r in rows if r["bucket"] == "retention")),
+                "ceded": money(sum(r["ceded_amount"] for r in rows if r["bucket"] == "layer")),
+                "uncovered": money(sum(r["gross_amount"] for r in rows if r["bucket"] == "uncovered")),
+                "breakdown": rows,
+            })
+
+        return {
+            "treaty": dict(treaty),
+            "retention": money(treaty["retention"]),
+            "retention_occupied": retention_total,
+            "retention_remaining": money(treaty["retention"] - retention_total),
+            "layers": layers,
+            "totals": {
+                "gross": gross_total,
+                "retention": retention_total,
+                "ceded": ceded_total,
+                "uncovered": uncovered_total,
+            },
+            "claims": claim_rows,
+            "overflows": overflows,
+            "recompute": recompute,
+        }
+
+    def list_treaties(self, role: str, actor: str = "") -> list[dict[str, Any]]:
+        require_role(role, STAFF_ROLES, "查看再保合约")
+        with self.connect() as conn:
+            treaties = conn.execute("SELECT * FROM reins_treaties ORDER BY id").fetchall()
+            result = []
+            for treaty in treaties:
+                view = self._ledger_view(conn, treaty["id"])
+                result.append({
+                    "treaty": view["treaty"],
+                    "totals": view["totals"],
+                    "layer_count": len(view["layers"]),
+                })
+            return result
+
+    def get_ledger(self, role: str, actor: str, event_id: str | None = None, treaty_id: int | None = None) -> dict[str, Any]:
+        require_role(role, STAFF_ROLES, "查看再保分保台账")
+        with self.connect() as conn:
+            if treaty_id is not None:
+                tid = int(treaty_id)
+            else:
+                row = self._trait_row(conn, (event_id or "").strip())
+                if not row:
+                    raise DomainError("该灾害事件没有分保合约", 404)
+                tid = row["id"]
+            return self._ledger_view(conn, tid)
+
+    def confirm_ledger(self, actor: str, role: str, treaty_id: int, expected_version: int) -> dict[str, Any]:
+        """财务保存确认分保结果；尚有案件超出层上限（未覆盖）时整体挡下并列出明细。"""
+        actor = actor_id(actor)
+        require_role(role, {"finance", "supervisor"}, "确认再保分保")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            treaty = self._require_treaty(conn, treaty_id)
+            if treaty["version"] != int(expected_version):
+                raise DomainError("合约已变化，请刷新后重试", 409)
+            event_id = treaty["event_id"]
+            recompute = self._recompute_event_ledger(conn, event_id, actor)
+            view = self._ledger_view(conn, treaty_id, recompute=recompute)
+            uncovered = view["totals"]["uncovered"]
+            if uncovered > CENT_EPS:
+                details = {
+                    "treaty_id": treaty_id,
+                    "event_id": event_id,
+                    "uncovered_total": uncovered,
+                    "blocked_claims": [
+                        {
+                            "claim_id": row["claim_id"],
+                            "claim_no": row["claim_no"],
+                            "final_payout": row["final_payout"],
+                            "uncovered_amount": row["uncovered"],
+                            "overflow_layers": [
+                                {
+                                    "layer_id": overflow["layer_id"],
+                                    "layer_order": overflow.get("layer_order"),
+                                    "reinsurer": overflow.get("reinsurer"),
+                                    "bucket": overflow["bucket"],
+                                    "amount": overflow["amount"],
+                                }
+                                for overflow in view["overflows"]
+                                if overflow["claim_id"] == row["claim_id"] and overflow["amount"] > CENT_EPS
+                            ],
+                        }
+                        for row in view["claims"] if row["uncovered"] > CENT_EPS
+                    ],
+                    "layers": [
+                        {"layer_id": layer["id"], "layer_order": layer["layer_order"],
+                         "reinsurer": layer["reinsurer"], "payout_limit": layer["payout_limit"],
+                         "occupied": layer["occupied"], "remaining": layer["remaining"]}
+                        for layer in view["layers"]
+                    ],
+                }
+                raise DomainError(
+                    "分保层上限不足，存在 %s 元未覆盖赔付，请扩容或调整合约后再确认" % format(uncovered, ".2f"),
+                    409, details,
+                )
+            now = utcnow()
+            conn.execute(
+                "UPDATE reins_treaties SET status='confirmed',confirmed_by=?,confirmed_at=?,version=version+1,updated_at=? WHERE id=?",
+                (actor, now, now, treaty_id),
+            )
+            self._audit(conn, None, actor, "reinsurance.ledger_confirmed", {
+                "treaty_id": treaty_id, "event_id": event_id,
+                "retention": view["totals"]["retention"], "ceded": view["totals"]["ceded"],
+            })
+            return self._ledger_view(conn, treaty_id)
+
     def queue(self, role: str = "viewer", actor: str = "") -> list[dict[str, Any]]:
-        if role not in {"intake", "supervisor", "adjuster", "surveyor", "auditor"}:
+        if role not in STAFF_ROLES:
             raise DomainError("角色无权查看理赔队列", 403)
         with self.connect() as conn:
             if role in {"adjuster", "surveyor"}:
@@ -423,7 +823,7 @@ class CatastropheClaimService:
         return [dict(r) for r in rows]
 
     def state(self, actor: str = "", role: str = "viewer") -> dict[str, Any]:
-        allowed = role in {"intake", "supervisor", "adjuster", "surveyor", "auditor"}
+        allowed = role in STAFF_ROLES
         if not allowed:
             return {"claims": [], "evidence": [], "payments": [], "timeline": [], "access_limited": True}
         with self.connect() as conn:
@@ -449,6 +849,10 @@ class CatastropheClaimService:
                 return {"seeded": False, "reason": "已有数据"}
         c1 = self.create_claim("intake-demo", "intake", "CLM-DEMO-001", "TY2026", "沿海A区", "洪水", "P-1001", "R-01", 30.1, 121.2, 500000, True, True)
         self.create_claim("intake-demo", "intake", "CLM-DEMO-002", "TY2026", "沿海A区", "洪水", "P-1002", "R-02", 30.2, 121.3, 240000, False, False)
+        self.create_treaty("fin-demo", "finance", "TY2026", 100000, [
+            {"layer_order": 1, "reinsurer": "中再集团", "cede_ratio": 0.8, "payout_limit": 200000},
+            {"layer_order": 2, "reinsurer": "慕尼黑再", "cede_ratio": 0.9, "payout_limit": 300000},
+        ])
         return {"seeded": True, "first_claim_id": c1["id"]}
 
 
@@ -498,10 +902,26 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif path == "/api/queue":
                 actor, role = self._headers()
                 self._send(200, {"queue": self.service.queue(role, actor)})
+            elif path == "/api/reinsurance/treaties":
+                actor, role = self._headers()
+                self._send(200, {"treaties": self.service.list_treaties(role, actor)})
+            elif path == "/api/reinsurance/ledger":
+                actor, role = self._headers()
+                query = parse_qs(urlparse(self.path).query)
+                event_id = query.get("event_id", [""])[0]
+                treaty_id = query.get("treaty_id", [""])[0]
+                try:
+                    tid = int(treaty_id) if treaty_id else None
+                except ValueError as exc:
+                    raise DomainError("treaty_id 必须是整数") from exc
+                self._send(200, self.service.get_ledger(role, actor, event_id=event_id, treaty_id=tid))
             else:
                 self._send(404, {"error": "接口不存在"})
         except DomainError as exc:
-            self._send(exc.status, {"error": str(exc)})
+            payload: dict[str, Any] = {"error": str(exc)}
+            if exc.details is not None:
+                payload["details"] = exc.details
+            self._send(exc.status, payload)
 
     def do_POST(self) -> None:
         try:
@@ -522,11 +942,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.emergency_advance(actor, role, **data)
             elif path == "/api/claims/finalize":
                 result = self.service.finalize_claim(actor, role, **data)
+            elif path == "/api/reinsurance/treaties":
+                result = self.service.create_treaty(actor, role, **data)
+            elif path == "/api/reinsurance/confirm":
+                result = self.service.confirm_ledger(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
         except DomainError as exc:
-            self._send(exc.status, {"error": str(exc)})
+            payload = {"error": str(exc)}
+            if exc.details is not None:
+                payload["details"] = exc.details
+            self._send(exc.status, payload)
         except (KeyError, TypeError, ValueError) as exc:
             self._send(400, {"error": "请求参数错误: %s" % exc})
         except Exception as exc:
