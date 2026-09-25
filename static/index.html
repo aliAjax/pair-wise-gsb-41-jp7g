@@ -1,0 +1,6 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>巨灾理赔调度</title>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#263746}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#f1f5f7}.card{background:#fff8eb;border-left:5px solid #d58b21;padding:12px 16px}code{background:#eef2f4;padding:2px 5px}</style>
+<h1>巨灾保险理赔调度</h1><div class="card">状态页按调用角色过滤。写入接口需要 <code>X-User</code>、<code>X-Role</code>，详见 README。</div>
+<h2>优先队列</h2><table id="claims"><thead><tr><th>报案号</th><th>区域</th><th>状态</th><th>优先级</th><th>欺诈分</th><th>负责人</th></tr></thead><tbody></tbody></table>
+<h2>最近时间线</h2><ol id="timeline"></ol>
+<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#claims tbody').innerHTML=d.claims.map(r=>`<tr><td>${r.claim_no}</td><td>${r.region}</td><td>${r.status}</td><td>${r.priority_score.toFixed(1)}</td><td>${r.fraud_score}</td><td>${r.assignee||''}</td></tr>`).join('');document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>

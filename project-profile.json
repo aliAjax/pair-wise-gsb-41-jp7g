@@ -1,0 +1,11 @@
+{
+  "projectId": "pair-wise-gsb-41",
+  "projectName": "pair-wise-gsb-41",
+  "category": "地狱 Python 项目",
+  "businessDomain": "巨灾保险",
+  "projectForm": "完整项目",
+  "codeScope": "backend, frontend",
+  "languages": ["Python", "HTML", "CSS", "JavaScript"],
+  "summary": "巨灾保险理赔受理、风险分级、查勘复核、紧急预付和最终核定服务。",
+  "containerized": false
+}
